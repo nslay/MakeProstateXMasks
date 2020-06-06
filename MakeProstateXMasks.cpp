@@ -34,6 +34,8 @@
 #include <utility>
 #include <map>
 #include <unordered_set>
+#include <unordered_map>
+#include <random>
 #include "Common.h"
 #include "bsdgetopt.h"
 
@@ -41,8 +43,10 @@
 #include "itkImageBase.h"
 #include "itkPoint.h"
 
+typedef std::mt19937_64 GeneratorType;
+
 void Usage(const char *p_cArg0) {
-  std::cerr << "Usage: " << p_cArg0 << " [-h] -f findings.csv -d t2wRootFolder -o outputRootFolder -l listFile.txt" << std::endl;
+  std::cerr << "Usage: " << p_cArg0 << " [-h] -f findings.csv -d t2wRootFolder -o outputRootFolder [-t trainingListFile.txt] [-v validationListFile.txt] [-r validationRatio] [-s seedString]" << std::endl;
   exit(1);
 }
 
@@ -94,8 +98,18 @@ struct Finding {
   double Distance(const PointType &clOther) const { return (double)clPosition.EuclideanDistanceTo(clOther); }
 };
 
+GeneratorType & GetGenerator() {
+  static GeneratorType clGenerator;
+  return clGenerator;
+}
+
 std::vector<Finding> LoadFindings(const std::string &strFileName);
 std::map<std::string, std::vector<Finding>> LoadFindingsMap(const std::string &strFileName);
+std::unordered_map<std::string, std::vector<Finding>> LoadFindingsUnorderedMap(const std::string &strFileName);
+
+// Make sure we fairly assign positive/negative cases to training/validation
+// Returns index to end of training set [training|validation]
+size_t BalancedShuffle(std::vector<std::pair<std::string, std::vector<Finding>>> &vFindingsPairs, double dValidationRatio);
 
 template<typename PixelType>
 typename itk::Image<PixelType, 3>::Pointer LoadT2WImage(const std::string &strPath);
@@ -107,13 +121,16 @@ std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, co
 int main(int argc, char **argv) {
   const char * const p_cArg0 = argv[0];
 
+  std::string strSeedString = "prostatex";
   std::string strDataRoot;
   std::string strOutputRoot;
   std::string strCsvFile;
-  std::string strListFile = "trainingList.txt";
+  std::string strTrainingListFile = "trainingList.txt";
+  std::string strValidationListFile = "validationList.txt";
+  double dValidationRatio = 0.1; // 10% of the cases are hold out
 
   int c = 0;
-  while ((c = getopt(argc, argv, "d:f:hl:o:")) != -1) {
+  while ((c = getopt(argc, argv, "d:f:ho:r:s:t:v:")) != -1) {
     switch (c) {
     case 'd':
       strDataRoot = optarg;
@@ -124,11 +141,26 @@ int main(int argc, char **argv) {
     case 'h':
       Usage(p_cArg0);
       break;
-    case 'l':
-      strListFile = optarg;
-      break;
     case 'o':
       strOutputRoot = optarg;
+      break;
+    case 'r':
+      {
+        char *p = nullptr;
+        dValidationRatio = strtod(optarg, &p);
+
+        if (*p != '\0' || dValidationRatio < 0.0 || dValidationRatio > 1.0)
+          Usage(p_cArg0);
+      }
+      break;
+    case 's':
+      strSeedString = optarg;
+      break;
+    case 't':
+      strTrainingListFile = optarg;
+      break;
+    case 'v':
+      strValidationListFile = optarg;
       break;
     case '?':
     default:
@@ -143,24 +175,44 @@ int main(int argc, char **argv) {
   if (strDataRoot.empty() || strOutputRoot.empty() || strCsvFile.empty())
     Usage(p_cArg0);
 
-  auto mFindings = LoadFindingsMap(strCsvFile);
+  std::cout << "Info: Using seed string '" << strSeedString << "'." << std::endl;
+
+  std::seed_seq clSeed(strSeedString.begin(), strSeedString.end());
+  GetGenerator().seed(clSeed);
+
+  auto mFindings = LoadFindingsUnorderedMap(strCsvFile);
 
   if (mFindings.empty()) {
     std::cerr << "Error: Failed to load findings." << std::endl;
     return -1;
   }
 
-  std::cout << "Info: Saving training list file to '" << strListFile << "' ..." << std::endl;
-  std::ofstream listStream(strListFile, std::ofstream::trunc);
+  // Make it a vector so we can shuffle
+  std::vector<std::pair<std::string, std::vector<Finding>>> vFindingsPairs(mFindings.begin(), mFindings.end());
 
-  if (!listStream) {
+  std::cout << "Info: Shuffling findings ..." << std::endl;
+  const size_t trainingSize = BalancedShuffle(vFindingsPairs, dValidationRatio);
+
+  std::cout << "Info: Saving training list file to '" << strTrainingListFile << "' ..." << std::endl;
+  std::cout << "Info: Saving validation list file to '" << strValidationListFile << "' (ratio = " << dValidationRatio << ") ..." << std::endl;
+
+  std::ofstream trainingListStream(strTrainingListFile, std::ofstream::trunc);
+  std::ofstream validationListStream(strValidationListFile, std::ofstream::trunc);
+
+  if (!trainingListStream) {
     std::cerr << "Error: Could not open training list file." << std::endl;
+    return -1;
+  }
+
+  if (!validationListStream) {
+    std::cerr << "Error: Could not open validation list file." << std::endl;
     return -1;
   }
 
   typedef itk::Image<short, 3> ImageType;
 
-  for (const auto &stPair : mFindings) {
+  size_t i = 0;
+  for (const auto &stPair : vFindingsPairs) {
     std::cout << "Info: Processing '" << stPair.first << "' ..." << std::endl;
 
     const std::string strT2WPath = strDataRoot + '/' + stPair.first;
@@ -216,6 +268,8 @@ int main(int argc, char **argv) {
       std::cerr << "Error: Failed to save DICOM series." << std::endl;
       return -1;
     }
+
+    std::ostream &listStream = (i++) < trainingSize ? trainingListStream : validationListStream;
 
     for (auto index : vSlices) {
       // NOTE: Common's SaveDicomImage uses z+1 as index number
@@ -316,6 +370,88 @@ std::map<std::string, std::vector<Finding>> LoadFindingsMap(const std::string &s
   return mFindings;
 }
 
+std::unordered_map<std::string, std::vector<Finding>> LoadFindingsUnorderedMap(const std::string &strFileName) {
+  std::vector<Finding> vFindings = LoadFindings(strFileName);
+
+  std::unordered_map<std::string, std::vector<Finding>> mFindings;
+
+  for (Finding &stFinding : vFindings)
+    mFindings[stFinding.strPatientId].emplace_back(std::move(stFinding));
+
+  return mFindings;
+}
+
+// Returns index to end of training set [training|validation]
+size_t BalancedShuffle(std::vector<std::pair<std::string, std::vector<Finding>>> &vFindingsPairs, double dValidationRatio) {
+  if (dValidationRatio <= 0.0) {
+    std::shuffle(vFindingsPairs.begin(), vFindingsPairs.end(), GetGenerator());
+    return vFindingsPairs.size();
+  }
+
+  if (dValidationRatio >= 1.0) {
+    std::shuffle(vFindingsPairs.begin(), vFindingsPairs.end(), GetGenerator());
+    return 0;
+  }
+
+  // Partition into [positive|negative] cases
+  const auto splitItr = std::partition(vFindingsPairs.begin(), vFindingsPairs.end(),
+    [](const auto &stPair) -> bool {
+      return std::find_if(stPair.second.begin(), stPair.second.end(),
+        [](const Finding &stFinding) -> bool { 
+          return stFinding.eLabel == Finding::True; 
+        }) != stPair.second.end();
+    });
+
+  std::shuffle(vFindingsPairs.begin(), splitItr, GetGenerator());
+  std::shuffle(splitItr, vFindingsPairs.end(), GetGenerator());
+
+  const size_t posSize = (splitItr - vFindingsPairs.begin());
+  const size_t negSize = (vFindingsPairs.end() - splitItr);
+
+  std::cout << "Info: Clinically significant cases = " << posSize << ", negative cases = " << negSize << std::endl;
+
+  // Calculate sizes
+  const size_t validationPosSize = (size_t)(dValidationRatio * posSize);
+  const size_t validationNegSize = (size_t)(dValidationRatio * negSize);
+
+  const size_t trainingPosSize = posSize - validationPosSize;
+  const size_t trainingNegSize = negSize - validationNegSize;
+
+  // Iterator ranges
+  const auto trainingPosBegin = vFindingsPairs.begin();
+  const auto trainingPosEnd = trainingPosBegin + trainingPosSize;
+
+  const auto trainingNegBegin = splitItr;
+  const auto trainingNegEnd = trainingNegBegin + trainingNegSize;
+
+  const auto validationPosBegin = trainingPosEnd;
+  const auto validationPosEnd = validationPosBegin + validationPosSize;
+
+  const auto validationNegBegin = trainingNegEnd;
+  const auto validationNegEnd = validationNegBegin + validationNegSize;
+
+  std::vector<std::pair<std::string, std::vector<Finding>>> vShuffledFindings(vFindingsPairs.size());
+
+  auto outItr = vShuffledFindings.begin();
+
+  outItr = std::move(trainingPosBegin, trainingPosEnd, outItr);
+  outItr = std::move(trainingNegBegin, trainingNegEnd, outItr);
+
+  const size_t trainingSize = outItr - vShuffledFindings.begin();
+
+  outItr = std::move(validationPosBegin, validationPosEnd, outItr);
+  outItr = std::move(validationNegBegin, validationNegEnd, outItr);
+
+  // Now swap to return the shuffled findings
+  vFindingsPairs.swap(vShuffledFindings);
+
+  // Shuffle overall training/validation cases
+  std::shuffle(vFindingsPairs.begin(), vFindingsPairs.begin() + trainingSize, GetGenerator());
+  std::shuffle(vFindingsPairs.begin() + trainingSize, vFindingsPairs.end(), GetGenerator());
+
+  return trainingSize;
+}
+
 template<typename PixelType>
 typename itk::Image<PixelType, 3>::Pointer LoadT2WImage(const std::string &strPath) {
   // I store T2W cases in a hierarchy like
@@ -334,24 +470,11 @@ typename itk::Image<PixelType, 3>::Pointer LoadT2WImage(const std::string &strPa
 
 template<typename PixelType>
 std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, const std::vector<Finding> &vFindings) {
-  constexpr double dPositiveDistance = 5.0; // < 5 = +1
+  constexpr double dPositiveDistance = 5.0; // < 5 = clinical significance (+/-1)
   constexpr double dDontCareDistance = 8.0; // < 8 = -1 (we don't know lesion size!)
                                             // Everything else 0
 
   if (p_clMask == nullptr || vFindings.empty())
-    return std::vector<itk::IndexValueType>();
-
-  std::vector<Finding> vPositiveFindings;
-
-  vPositiveFindings.reserve(vFindings.size());
-
-  for (const Finding &stFinding : vFindings) {
-    if (stFinding.eLabel == Finding::True)
-      vPositiveFindings.push_back(stFinding);
-  }
-
-  // No clinically significant lesions
-  if (vPositiveFindings.empty())
     return std::vector<itk::IndexValueType>();
 
   const itk::Size<3> clSize = p_clMask->GetBufferedRegion().GetSize();
@@ -365,7 +488,7 @@ std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, co
         Finding::PointType clVolumePosition;
         p_clMask->TransformIndexToPhysicalPoint(clIndex, clVolumePosition);
 
-        auto minItr = std::min_element(vPositiveFindings.begin(), vPositiveFindings.end(),
+        auto minItr = std::min_element(vFindings.begin(), vFindings.end(),
           [&clVolumePosition](const Finding &a, const Finding &b) -> bool {
             return a.Distance2(clVolumePosition) < b.Distance2(clVolumePosition);
           });
@@ -373,10 +496,12 @@ std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, co
         const double dDistanceToBiopsy = minItr->Distance(clVolumePosition);
         if (dDistanceToBiopsy < dPositiveDistance) {
           sSlices.insert(z);
-          p_clMask->SetPixel(clIndex, 1);
+          const short sLabel = minItr->eLabel == Finding::True ? 1 : 0;
+          p_clMask->SetPixel(clIndex, sLabel);
         }
         else if (dDistanceToBiopsy < dDontCareDistance) {
-          p_clMask->SetPixel(clIndex, -1);
+          const short sLabel = minItr->eLabel == Finding::True ? -1 : 0;
+          p_clMask->SetPixel(clIndex, sLabel);
         }
         else {
           p_clMask->SetPixel(clIndex, 0);
