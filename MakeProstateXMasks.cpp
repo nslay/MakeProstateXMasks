@@ -116,7 +116,7 @@ typename itk::Image<PixelType, 3>::Pointer LoadT2WImage(const std::string &strPa
 
 // Returns z coordinates with positive examples
 template<typename PixelType>
-std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, const std::vector<Finding> &vFindings);
+std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, const std::vector<Finding> &vFindings, unsigned int a_iCounts[2]);
 
 int main(int argc, char **argv) {
   const char * const p_cArg0 = argv[0];
@@ -180,7 +180,7 @@ int main(int argc, char **argv) {
   std::seed_seq clSeed(strSeedString.begin(), strSeedString.end());
   GetGenerator().seed(clSeed);
 
-  auto mFindings = LoadFindingsUnorderedMap(strCsvFile);
+  auto mFindings = LoadFindingsMap(strCsvFile);
 
   if (mFindings.empty()) {
     std::cerr << "Error: Failed to load findings." << std::endl;
@@ -210,6 +210,8 @@ int main(int argc, char **argv) {
   }
 
   typedef itk::Image<short, 3> ImageType;
+  unsigned int a_uiTrainingCounts[2] = { 0, 0 };
+  unsigned int a_uiValidationCounts[2] = { 0, 0 };
 
   size_t i = 0;
   for (const auto &stPair : vFindingsPairs) {
@@ -253,7 +255,9 @@ int main(int argc, char **argv) {
     std::string strStudyDate;
     ExposeStringMetaData(p_clT2WImage->GetMetaDataDictionary(), "0008|0020", strStudyDate);
 
-    std::vector<itk::IndexValueType> vSlices = MakeMask<ImageType::PixelType>(p_clMask, stPair.second);
+    unsigned int * const a_uiCounts = i < trainingSize ? a_uiTrainingCounts : a_uiValidationCounts;
+
+    std::vector<itk::IndexValueType> vSlices = MakeMask<ImageType::PixelType>(p_clMask, stPair.second, a_uiCounts);
 
     if (vSlices.empty()) {
       std::cout << "Info: Negative case. Skipping..." << std::endl;
@@ -276,6 +280,9 @@ int main(int argc, char **argv) {
       listStream << strOutputPath << '/' << index+1 << ".dcm\n";
     }
   }
+
+  std::cout << "Info: Training negative count = " << a_uiTrainingCounts[0] << ", positive count = " << a_uiTrainingCounts[1] << std::endl;
+  std::cout << "Info: Validation negative count = " << a_uiValidationCounts[0] << ", positive count = " << a_uiValidationCounts[1] << std::endl;
 
   return 0;
 }
@@ -469,7 +476,7 @@ typename itk::Image<PixelType, 3>::Pointer LoadT2WImage(const std::string &strPa
 }
 
 template<typename PixelType>
-std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, const std::vector<Finding> &vFindings) {
+std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, const std::vector<Finding> &vFindings, unsigned int a_uiCounts[2]) {
   constexpr double dPositiveDistance = 5.0; // < 5 = clinical significance (+/-1)
   constexpr double dDontCareDistance = 8.0; // < 8 = -1 (we don't know lesion size!)
                                             // Everything else 0
@@ -481,6 +488,8 @@ std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, co
   std::unordered_set<itk::IndexValueType> sSlices;
 
   for (itk::IndexValueType z = 0; itk::SizeValueType(z) < clSize[2]; ++z) {
+    unsigned int a_uiTmpCounts[2] = { 0, 0 };
+
     for (itk::IndexValueType y = 0; itk::SizeValueType(y) < clSize[1]; ++y) {
       for (itk::IndexValueType x = 0; itk::SizeValueType(x) < clSize[0]; ++x) {
         const itk::Index<3> clIndex = {{ x, y, z }};
@@ -498,15 +507,27 @@ std::vector<itk::IndexValueType> MakeMask(itk::Image<PixelType, 3> *p_clMask, co
           sSlices.insert(z);
           const short sLabel = minItr->eLabel == Finding::True ? 1 : 0;
           p_clMask->SetPixel(clIndex, sLabel);
+
+          ++a_uiTmpCounts[sLabel];
         }
         else if (dDistanceToBiopsy < dDontCareDistance) {
           const short sLabel = minItr->eLabel == Finding::True ? -1 : 0;
           p_clMask->SetPixel(clIndex, sLabel);
+
+          if (sLabel >= 0)
+            ++a_uiTmpCounts[sLabel];
         }
         else {
           p_clMask->SetPixel(clIndex, 0);
+          ++a_uiTmpCounts[0];
         }
       }
+    }
+
+    // Only count for slices used in training/validation
+    if (sSlices.find(z) != sSlices.end()) {
+      a_uiCounts[0] += a_uiTmpCounts[0];
+      a_uiCounts[1] += a_uiTmpCounts[1];
     }
   }
 
